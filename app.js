@@ -97,24 +97,58 @@ function handleData(statement, variables) {
   const declarations = body.split(',').map((part) => part.trim()).filter(Boolean);
 
   for (const declaration of declarations) {
-    const match = declaration.match(/^(?<name>[a-z_][\w-]*)\s+TYPE\s+(?<type>i|string)(?:\s+VALUE\s+(?<value>.+))?$/i);
+    const match = declaration.match(/^(?<name>[a-z_][\w-]*)\s+TYPE\s+(?<type>[a-z]+)(?<rest>.*)$/i);
     if (!match) {
       throw new Error(`No se pudo interpretar la declaración: "${declaration}"`);
     }
 
-    const { name, type } = match.groups;
-    let value = match.groups.value ? evaluateExpression(match.groups.value, variables) : undefined;
+    const { name } = match.groups;
+    const type = match.groups.type.toLowerCase();
+    let rest = (match.groups.rest || '').trim();
 
-    if (type.toLowerCase() === 'i') {
-      value = value !== undefined ? Number(value) : 0;
-      if (Number.isNaN(value)) {
-        throw new Error(`El valor inicial de ${name} debe ser numérico.`);
+    let length;
+    let decimals;
+    let valueExpression;
+
+    if (rest) {
+      const valueMatch = rest.match(/\bVALUE\s+(.+)$/i);
+      if (valueMatch) {
+        valueExpression = valueMatch[1].trim();
+        rest = rest.slice(0, valueMatch.index).trim();
       }
-    } else {
-      value = value !== undefined ? String(value) : '';
+
+      const lengthMatch = rest.match(/\bLENGTH\s+(\d+)/i);
+      if (lengthMatch) {
+        length = Number(lengthMatch[1]);
+        rest = (rest.slice(0, lengthMatch.index) + rest.slice(lengthMatch.index + lengthMatch[0].length)).trim();
+      }
+
+      const decimalsMatch = rest.match(/\bDECIMALS\s+(\d+)/i);
+      if (decimalsMatch) {
+        decimals = Number(decimalsMatch[1]);
+        rest = (rest.slice(0, decimalsMatch.index) + rest.slice(decimalsMatch.index + decimalsMatch[0].length)).trim();
+      }
+
+      if (rest.length > 0) {
+        throw new Error(`Parámetros no reconocidos en la declaración: "${declaration}"`);
+      }
     }
 
-    variables.set(name.toLowerCase(), { type: type.toLowerCase(), value });
+    if (length !== undefined && (!Number.isInteger(length) || length <= 0)) {
+      throw new Error(`LENGTH debe ser un entero positivo en la declaración de ${name}.`);
+    }
+
+    if (decimals !== undefined && (!Number.isInteger(decimals) || decimals < 0)) {
+      throw new Error(`DECIMALS debe ser un entero no negativo en la declaración de ${name}.`);
+    }
+
+    validateTypeDefinition(type, { length, decimals }, name);
+
+    const definition = { type, length, decimals };
+    let value = valueExpression ? evaluateExpression(valueExpression, variables) : undefined;
+    value = coerceValueByType(definition, value, { initializing: true, variableName: name });
+
+    variables.set(name.toLowerCase(), { ...definition, value });
   }
 }
 
@@ -162,21 +196,25 @@ function handleAdd(statement, variables) {
     throw new Error(`Sintaxis ADD inválida: "${statement}"`);
   }
 
-  const amount = Number(evaluateExpression(match[1], variables));
   const targetName = match[2].toLowerCase();
   const target = variables.get(targetName);
 
   if (!target) {
     throw new Error(`Variable "${match[2]}" no declarada.`);
   }
-  if (target.type !== 'i') {
-    throw new Error('ADD solo admite variables de tipo I.');
-  }
-  if (Number.isNaN(amount)) {
-    throw new Error('ADD requiere un valor numérico.');
-  }
 
-  target.value += amount;
+  ensureNumericType(target, 'ADD');
+
+  const amountRaw = evaluateExpression(match[1], variables);
+  const amount = coerceValueByType(target, amountRaw, { variableName: match[1], numericOperation: true });
+  const result = target.value + amount;
+  target.value = coerceValueByType(target, result, { variableName: match[2], numericOperation: true });
+}
+
+function ensureNumericType(variable, operation) {
+  if (!['i', 'p', 'f'].includes(variable.type)) {
+    throw new Error(`${operation} solo admite variables numéricas.`);
+  }
 }
 
 function handleSubtract(statement, variables) {
@@ -185,21 +223,19 @@ function handleSubtract(statement, variables) {
     throw new Error(`Sintaxis SUBTRACT inválida: "${statement}"`);
   }
 
-  const amount = Number(evaluateExpression(match[1], variables));
   const targetName = match[2].toLowerCase();
   const target = variables.get(targetName);
 
   if (!target) {
     throw new Error(`Variable "${match[2]}" no declarada.`);
   }
-  if (target.type !== 'i') {
-    throw new Error('SUBTRACT solo admite variables de tipo I.');
-  }
-  if (Number.isNaN(amount)) {
-    throw new Error('SUBTRACT requiere un valor numérico.');
-  }
 
-  target.value -= amount;
+  ensureNumericType(target, 'SUBTRACT');
+
+  const amountRaw = evaluateExpression(match[1], variables);
+  const amount = coerceValueByType(target, amountRaw, { variableName: match[1], numericOperation: true });
+  const result = target.value - amount;
+  target.value = coerceValueByType(target, result, { variableName: match[2], numericOperation: true });
 }
 
 function handleClear(statement, variables) {
@@ -212,7 +248,7 @@ function handleClear(statement, variables) {
   if (!variable) {
     throw new Error(`Variable "${match[1]}" no declarada.`);
   }
-  variable.value = variable.type === 'i' ? 0 : '';
+  variable.value = coerceValueByType(variable, undefined, { initializing: true, variableName: match[1] });
 }
 
 function handleAssignment(statement, variables) {
@@ -227,17 +263,148 @@ function handleAssignment(statement, variables) {
     throw new Error(`Variable "${match[1]}" no declarada.`);
   }
 
-  let value = evaluateExpression(match[2], variables);
-  if (variable.type === 'i') {
-    value = Number(value);
-    if (Number.isNaN(value)) {
-      throw new Error(`La variable ${match[1]} requiere un valor numérico.`);
-    }
-  } else {
-    value = String(value);
+  const value = evaluateExpression(match[2], variables);
+  variable.value = coerceValueByType(variable, value, { variableName: match[1] });
+}
+
+function validateTypeDefinition(type, metadata, variableName) {
+  const upperName = variableName.toUpperCase();
+  switch (type) {
+    case 'i':
+      if (metadata.length !== undefined) {
+        throw new Error(`El tipo I no admite LENGTH (variable ${upperName}).`);
+      }
+      if (metadata.decimals !== undefined) {
+        throw new Error(`El tipo I no admite DECIMALS (variable ${upperName}).`);
+      }
+      break;
+    case 'f':
+      if (metadata.length !== undefined) {
+        throw new Error(`El tipo F no admite LENGTH (variable ${upperName}).`);
+      }
+      if (metadata.decimals !== undefined) {
+        throw new Error(`El tipo F no admite DECIMALS (variable ${upperName}).`);
+      }
+      break;
+    case 'p':
+      if (metadata.length !== undefined && metadata.length <= 0) {
+        throw new Error(`LENGTH debe ser mayor que cero para ${upperName}.`);
+      }
+      if (metadata.decimals !== undefined && metadata.length !== undefined && metadata.decimals > metadata.length) {
+        throw new Error(`DECIMALS no puede superar LENGTH para ${upperName}.`);
+      }
+      break;
+    case 'n':
+      if (metadata.decimals !== undefined) {
+        throw new Error(`El tipo N no admite DECIMALS (variable ${upperName}).`);
+      }
+      break;
+    case 'd':
+      if (metadata.length !== undefined) {
+        throw new Error(`El tipo D no admite LENGTH (variable ${upperName}).`);
+      }
+      if (metadata.decimals !== undefined) {
+        throw new Error(`El tipo D no admite DECIMALS (variable ${upperName}).`);
+      }
+      break;
+    case 'string':
+      if (metadata.length !== undefined || metadata.decimals !== undefined) {
+        throw new Error(`El tipo STRING no admite LENGTH ni DECIMALS (variable ${upperName}).`);
+      }
+      break;
+    case 'c':
+      if (metadata.decimals !== undefined) {
+        throw new Error(`El tipo C no admite DECIMALS (variable ${upperName}).`);
+      }
+      break;
+    default:
+      throw new Error(`Tipo "${type}" no soportado para la variable ${upperName}.`);
+  }
+}
+
+function coerceValueByType(definition, rawValue, options = {}) {
+  const { type, length, decimals } = definition;
+  const { initializing = false, variableName, numericOperation = false } = options;
+  const label = variableName ? ` ${variableName.toUpperCase()}` : '';
+  const hasValue = rawValue !== undefined && rawValue !== null;
+
+  if (!hasValue && !(initializing || numericOperation)) {
+    throw new Error(`Se requiere un valor para la variable${label}.`);
   }
 
-  variable.value = value;
+  switch (type) {
+    case 'i': {
+      const numericValue = hasValue ? Number(rawValue) : 0;
+      if (!Number.isFinite(numericValue)) {
+        throw new Error(`El valor asignado a${label} debe ser numérico.`);
+      }
+      return Math.trunc(numericValue);
+    }
+    case 'p': {
+      const numericValue = hasValue ? Number(rawValue) : 0;
+      if (!Number.isFinite(numericValue)) {
+        throw new Error(`El valor asignado a${label} debe ser numérico.`);
+      }
+      if (typeof decimals === 'number') {
+        return Number(numericValue.toFixed(decimals));
+      }
+      return numericValue;
+    }
+    case 'f': {
+      const numericValue = hasValue ? Number(rawValue) : 0;
+      if (!Number.isFinite(numericValue)) {
+        throw new Error(`El valor asignado a${label} debe ser numérico.`);
+      }
+      return numericValue;
+    }
+    case 'n': {
+      const effectiveLength = length;
+      let stringValue = hasValue
+        ? String(rawValue)
+        : effectiveLength !== undefined
+        ? ''.padStart(effectiveLength, '0')
+        : '0';
+
+      if (!/^\d*$/.test(stringValue)) {
+        throw new Error(`El valor asignado a${label} debe contener solo dígitos.`);
+      }
+
+      if (effectiveLength !== undefined) {
+        if (stringValue.length > effectiveLength) {
+          throw new Error(`El valor para${label} excede la longitud definida (${effectiveLength}).`);
+        }
+        stringValue = stringValue.padStart(effectiveLength, '0');
+      }
+
+      return stringValue;
+    }
+    case 'd': {
+      const stringValue = hasValue ? String(rawValue) : '00000000';
+
+      if (!/^\d{8}$/.test(stringValue)) {
+        throw new Error(`El valor asignado a${label} debe tener el formato AAAAMMDD.`);
+      }
+
+      return stringValue;
+    }
+    case 'c': {
+      const effectiveLength = length ?? 1;
+      let stringValue = hasValue ? String(rawValue) : ''.padEnd(effectiveLength, ' ');
+
+      if (stringValue.length > effectiveLength) {
+        stringValue = stringValue.slice(0, effectiveLength);
+      } else if (stringValue.length < effectiveLength) {
+        stringValue = stringValue.padEnd(effectiveLength, ' ');
+      }
+
+      return stringValue;
+    }
+    case 'string': {
+      return hasValue ? String(rawValue) : '';
+    }
+    default:
+      throw new Error(`Tipo "${type}" no soportado.`);
+  }
 }
 
 function evaluateExpression(expression, variables) {
