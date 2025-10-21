@@ -385,18 +385,23 @@ function handleLoop(node, variables, outputLines, messages) {
       throw new Error('LOOP AT INTO no admite asignar el resultado a otra tabla interna.');
     }
 
+    const elementMetadata = table.element;
+    const elementIsNumeric = isNumericType(elementMetadata.type);
+
     for (const entry of table.value) {
-      if (table.elementType === 'i') {
-        if (target.type !== 'i') {
-          throw new Error('El destino del LOOP AT debe ser de tipo I para tablas numéricas.');
-        }
-        target.value = entry.value;
-      } else {
-        if (target.type === 'i') {
-          throw new Error('El destino del LOOP AT no puede ser numérico para tablas de texto.');
-        }
-        target.value = entry.value;
+      if (elementIsNumeric && !isNumericType(target.type)) {
+        throw new Error('El destino del LOOP AT debe ser numérico para tablas numéricas.');
       }
+      if (!elementIsNumeric && isNumericType(target.type)) {
+        throw new Error('El destino del LOOP AT debe ser de texto para tablas no numéricas.');
+      }
+
+      const evaluation = { type: entry.type, value: entry.value };
+      target.value = coerceValueByType(
+        evaluation,
+        target,
+        `asignado durante LOOP AT ${node.tableIdentifier}`,
+      );
       executeSequence(node.body, variables, outputLines, messages);
     }
     return;
@@ -484,6 +489,208 @@ function evaluateCondition(condition, variables) {
   return convertToString(evaluation).length > 0;
 }
 
+const SIMPLE_TYPES = new Set(['i', 'string', 'c', 'p', 'f', 'n', 'd']);
+const TYPE_ALLOWED_OPTIONS = {
+  i: { length: false, decimals: false },
+  string: { length: true, decimals: false },
+  c: { length: true, decimals: false },
+  p: { length: true, decimals: true },
+  f: { length: false, decimals: false },
+  n: { length: true, decimals: false },
+  d: { length: false, decimals: false },
+};
+
+function isNumericType(type) {
+  return type === 'i' || type === 'p' || type === 'f';
+}
+
+function parseTypeSpecification(definition) {
+  const valueKeyword = definition.match(/\bVALUE\b/i);
+  let initialExpression = null;
+  let specBody = definition;
+
+  if (valueKeyword) {
+    const valueIndex = valueKeyword.index;
+    initialExpression = definition.slice(valueIndex + valueKeyword[0].length).trim();
+    specBody = definition.slice(0, valueIndex).trim();
+    if (!initialExpression) {
+      throw new Error('Se esperaba una expresión después de VALUE.');
+    }
+  }
+
+  if (!specBody) {
+    throw new Error('La especificación de tipo está vacía.');
+  }
+
+  const tokens = specBody.split(/\s+/).filter(Boolean);
+  const baseType = tokens.shift().toLowerCase();
+
+  if (!SIMPLE_TYPES.has(baseType)) {
+    throw new Error(`Tipo no soportado: ${baseType}`);
+  }
+
+  const metadata = { type: baseType };
+
+  const allowed = TYPE_ALLOWED_OPTIONS[baseType];
+
+  while (tokens.length) {
+    const keyword = tokens.shift().toLowerCase();
+    if (keyword === 'length') {
+      if (!allowed.length) {
+        throw new Error(`El tipo ${baseType.toUpperCase()} no admite el parámetro LENGTH.`);
+      }
+      if (!tokens.length) {
+        throw new Error('Se esperaba un valor numérico después de LENGTH.');
+      }
+      const lengthValue = Number(tokens.shift());
+      if (!Number.isInteger(lengthValue) || lengthValue <= 0) {
+        throw new Error('El parámetro LENGTH debe ser un entero positivo.');
+      }
+      metadata.length = lengthValue;
+      continue;
+    }
+    if (keyword === 'decimals') {
+      if (!allowed.decimals) {
+        throw new Error(`El tipo ${baseType.toUpperCase()} no admite el parámetro DECIMALS.`);
+      }
+      if (!tokens.length) {
+        throw new Error('Se esperaba un valor numérico después de DECIMALS.');
+      }
+      const decimalsValue = Number(tokens.shift());
+      if (!Number.isInteger(decimalsValue) || decimalsValue < 0) {
+        throw new Error('El parámetro DECIMALS debe ser un entero mayor o igual a cero.');
+      }
+      metadata.decimals = decimalsValue;
+      continue;
+    }
+    throw new Error(`Parámetro desconocido para el tipo ${baseType}: ${keyword}`);
+  }
+
+  return { metadata, initialExpression };
+}
+
+function getDefaultValueForType(metadata) {
+  switch (metadata.type) {
+    case 'i':
+    case 'p':
+    case 'f':
+      return 0;
+    case 'n': {
+      const length = metadata.length ?? 1;
+      return '0'.repeat(length);
+    }
+    case 'd':
+      return '00000000';
+    case 'c': {
+      const length = metadata.length ?? 1;
+      return ''.padEnd(length, ' ');
+    }
+    case 'string':
+      return '';
+    default:
+      throw new Error(`Tipo no soportado para inicialización: ${metadata.type}`);
+  }
+}
+
+function coerceToNumber(evaluation, metadata, contextLabel) {
+  if (evaluation.type === 'number') {
+    if (!Number.isFinite(evaluation.value)) {
+      throw new Error(`El valor${contextLabel} numérico debe ser finito.`);
+    }
+    return evaluation.value;
+  }
+
+  if (evaluation.type === 'string') {
+    const normalized = evaluation.value.trim();
+    if (!normalized.length) {
+      throw new Error(`El valor${contextLabel} no puede estar vacío.`);
+    }
+    const parsed = Number(normalized);
+    if (!Number.isFinite(parsed)) {
+      throw new Error(`El valor${contextLabel} debe ser numérico para el tipo ${metadata.type.toUpperCase()}.`);
+    }
+    return parsed;
+  }
+
+  throw new Error(`El valor${contextLabel} debe ser numérico para el tipo ${metadata.type.toUpperCase()}.`);
+}
+
+function coerceValueByType(evaluation, metadata, contextDescription) {
+  const contextLabel = contextDescription ? ` ${contextDescription}` : '';
+
+  switch (metadata.type) {
+    case 'i': {
+      const numericValue = coerceToNumber(evaluation, metadata, contextLabel);
+      return Math.trunc(numericValue);
+    }
+    case 'f': {
+      const numericValue = coerceToNumber(evaluation, metadata, contextLabel);
+      return numericValue;
+    }
+    case 'p': {
+      const numericValue = coerceToNumber(evaluation, metadata, contextLabel);
+      const decimals = metadata.decimals ?? 0;
+      const scaled = Number((numericValue).toFixed(decimals));
+      if (metadata.length !== undefined) {
+        const digits = Math.abs(scaled).toFixed(decimals).replace('.', '').replace('-', '');
+        if (digits.length > metadata.length) {
+          throw new Error('El valor excede la longitud permitida para el tipo P.');
+        }
+      }
+      return scaled;
+    }
+    case 'string': {
+      const asString = convertToString(evaluation);
+      if (metadata.length !== undefined && asString.length > metadata.length) {
+        throw new Error('El valor excede la longitud permitida para el tipo STRING.');
+      }
+      return asString;
+    }
+    case 'c': {
+      const asString = convertToString(evaluation);
+      if (metadata.length !== undefined && asString.length > metadata.length) {
+        throw new Error('El valor excede la longitud permitida para el tipo C.');
+      }
+      return metadata.length !== undefined ? asString.padEnd(metadata.length, ' ') : asString;
+    }
+    case 'n': {
+      let stringValue;
+      if (evaluation.type === 'number') {
+        stringValue = Math.trunc(evaluation.value).toString();
+      } else {
+        stringValue = convertToString(evaluation).trim();
+      }
+      if (!/^[-]?\d+$/.test(stringValue)) {
+        throw new Error('Los valores de tipo N deben contener únicamente dígitos.');
+      }
+      if (stringValue.startsWith('-')) {
+        throw new Error('Los valores de tipo N no pueden ser negativos.');
+      }
+      if (metadata.length !== undefined) {
+        if (stringValue.length > metadata.length) {
+          throw new Error('El valor excede la longitud permitida para el tipo N.');
+        }
+        stringValue = stringValue.padStart(metadata.length, '0');
+      }
+      return stringValue;
+    }
+    case 'd': {
+      let stringValue;
+      if (evaluation.type === 'number') {
+        stringValue = Math.trunc(evaluation.value).toString();
+      } else {
+        stringValue = convertToString(evaluation).trim();
+      }
+      if (!/^\d{8}$/.test(stringValue)) {
+        throw new Error('Los valores de tipo D deben tener el formato YYYYMMDD.');
+      }
+      return stringValue;
+    }
+    default:
+      throw new Error(`Tipo no soportado: ${metadata.type}`);
+  }
+}
+
 function handleData(statement, variables) {
   const body = statement.replace(/^DATA\s*:?/i, '').trim();
   if (!body) {
@@ -501,36 +708,28 @@ function handleData(statement, variables) {
     const name = match.groups.name;
     const definition = match.groups.definition.trim();
 
-    const tableMatch = definition.match(/^(?:(?:STANDARD|HASHED|SORTED)\s+)?TABLE\s+OF\s+(?<element>i|string)(?:\s+WITH\s+EMPTY\s+KEY)?$/i);
+    const tableMatch = definition.match(/^(?:(?:STANDARD|HASHED|SORTED)\s+)?TABLE\s+OF\s+(?<element>.+?)(?:\s+WITH\s+EMPTY\s+KEY)?$/i);
     if (tableMatch) {
-      const elementType = tableMatch.groups.element.toLowerCase();
-      variables.set(name.toLowerCase(), { type: 'table', elementType, value: [] });
+      const elementDefinition = tableMatch.groups.element.trim();
+      const { metadata: elementMetadata, initialExpression: elementInitial } = parseTypeSpecification(elementDefinition);
+      if (elementInitial !== null) {
+        throw new Error('Las tablas internas no admiten valores iniciales en esta versión.');
+      }
+      variables.set(name.toLowerCase(), { type: 'table', element: elementMetadata, value: [] });
       continue;
     }
 
-    const simpleMatch = definition.match(/^(?<type>i|string)(?:\s+VALUE\s+(?<value>.+))?$/i);
-    if (!simpleMatch) {
-      throw new Error(`No se pudo interpretar la declaración: "${declaration}"`);
-    }
-
-    const normalizedType = simpleMatch.groups.type.toLowerCase();
+    const { metadata, initialExpression } = parseTypeSpecification(definition);
     let value;
 
-    if (simpleMatch.groups.value !== undefined) {
-      const evaluation = evaluateExpression(simpleMatch.groups.value, variables);
-      if (normalizedType === 'i') {
-        if (evaluation.type !== 'number') {
-          throw new Error(`El valor inicial de ${name} debe ser numérico.`);
-        }
-        value = evaluation.value;
-      } else {
-        value = convertToString(evaluation);
-      }
+    if (initialExpression !== null) {
+      const evaluation = evaluateExpression(initialExpression, variables);
+      value = coerceValueByType(evaluation, metadata, `inicial para ${name}`);
     } else {
-      value = normalizedType === 'i' ? 0 : '';
+      value = getDefaultValueForType(metadata);
     }
 
-    variables.set(name.toLowerCase(), { type: normalizedType, value });
+    variables.set(name.toLowerCase(), { ...metadata, value });
   }
 }
 
@@ -589,11 +788,12 @@ function handleAdd(statement, variables) {
   if (!target) {
     throw new Error(`Variable "${match[2]}" no declarada.`);
   }
-  if (target.type !== 'i') {
-    throw new Error('ADD solo admite variables de tipo I.');
+  if (!isNumericType(target.type)) {
+    throw new Error('ADD solo admite variables numéricas.');
   }
 
-  target.value += amount;
+  const updatedEvaluation = { type: 'number', value: target.value + amount };
+  target.value = coerceValueByType(updatedEvaluation, target, `resultado de ADD sobre ${match[2]}`);
 }
 
 function handleSubtract(statement, variables) {
@@ -613,11 +813,12 @@ function handleSubtract(statement, variables) {
   if (!target) {
     throw new Error(`Variable "${match[2]}" no declarada.`);
   }
-  if (target.type !== 'i') {
-    throw new Error('SUBTRACT solo admite variables de tipo I.');
+  if (!isNumericType(target.type)) {
+    throw new Error('SUBTRACT solo admite variables numéricas.');
   }
 
-  target.value -= amount;
+  const updatedEvaluation = { type: 'number', value: target.value - amount };
+  target.value = coerceValueByType(updatedEvaluation, target, `resultado de SUBTRACT sobre ${match[2]}`);
 }
 
 function handleClear(statement, variables) {
@@ -634,7 +835,7 @@ function handleClear(statement, variables) {
     variable.value = [];
     return;
   }
-  variable.value = variable.type === 'i' ? 0 : '';
+  variable.value = getDefaultValueForType(variable);
 }
 
 function handleAppend(statement, variables) {
@@ -654,15 +855,13 @@ function handleAppend(statement, variables) {
     throw new Error(`"${match[2]}" no es una tabla interna.`);
   }
 
-  if (table.elementType === 'i') {
-    if (valueEvaluation.type !== 'number') {
-      throw new Error('APPEND requiere un valor numérico para tablas de tipo I.');
-    }
-    table.value.push({ type: 'number', value: valueEvaluation.value });
-    return;
-  }
-
-  table.value.push({ type: 'string', value: convertToString(valueEvaluation) });
+  const coercedValue = coerceValueByType(
+    valueEvaluation,
+    table.element,
+    `para APPEND en ${match[2]}`,
+  );
+  const entryType = isNumericType(table.element.type) ? 'number' : 'string';
+  table.value.push({ type: entryType, value: coercedValue });
 }
 
 function handleAssignment(statement, variables) {
@@ -682,14 +881,7 @@ function handleAssignment(statement, variables) {
   }
 
   const evaluation = evaluateExpression(match[2], variables);
-  if (variable.type === 'i') {
-    if (evaluation.type !== 'number') {
-      throw new Error(`La variable ${match[1]} requiere un valor numérico.`);
-    }
-    variable.value = evaluation.value;
-  } else {
-    variable.value = convertToString(evaluation);
-  }
+  variable.value = coerceValueByType(evaluation, variable, `asignado a ${match[1]}`);
 }
 
 function evaluateExpression(expression, variables) {
@@ -742,11 +934,11 @@ function evaluateExpression(expression, variables) {
       if (!variable) {
         throw new Error(`Variable "${token.value}" no declarada.`);
       }
-      if (variable.type === 'i') {
-        return { type: 'number', value: Number(variable.value) };
-      }
       if (variable.type === 'table') {
         throw new Error('Las tablas internas no pueden utilizarse en expresiones.');
+      }
+      if (isNumericType(variable.type)) {
+        return { type: 'number', value: Number(variable.value) };
       }
       return { type: 'string', value: String(variable.value) };
     }
