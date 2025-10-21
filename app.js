@@ -18,22 +18,156 @@ const editor = document.getElementById('abapEditor');
 const outputEl = document.getElementById('output');
 const messagesEl = document.getElementById('messages');
 const runButton = document.getElementById('runButton');
+const debugButton = document.getElementById('debugButton');
 const resetButton = document.getElementById('resetButton');
+const debugPanel = document.getElementById('debugPanel');
+const debugHint = document.getElementById('debugHint');
+const debugStatementEl = document.getElementById('debugStatement');
+const debugOutputEl = document.getElementById('debugOutput');
+const debugVariablesEl = document.getElementById('debugVariables');
+const debugPositionEl = document.getElementById('debugPosition');
+const debugPrevButton = document.getElementById('debugPrev');
+const debugNextButton = document.getElementById('debugNext');
+
+let debugSteps = [];
+let debugIndex = -1;
 
 editor.value = defaultProgram;
+clearDebugPanel();
 
 runButton.addEventListener('click', () => {
+  clearDebugPanel();
   const code = editor.value;
   const result = executeAbap(code);
   outputEl.textContent = result.output;
   messagesEl.textContent = result.messages.join('\n');
 });
 
+debugButton.addEventListener('click', () => {
+  const code = editor.value;
+  const result = collectDebugSteps(code);
+  outputEl.textContent = result.output;
+  messagesEl.textContent = result.messages.join('\n');
+  debugSteps = result.steps;
+
+  if (!debugSteps.length) {
+    debugPanel.hidden = true;
+    debugHint.hidden = false;
+    debugHint.textContent =
+      'No se generaron pasos de depuración. Ajusta el programa y vuelve a intentarlo.';
+    debugPositionEl.textContent = 'Paso 0 de 0';
+    debugStatementEl.textContent = '';
+    debugOutputEl.textContent = '';
+    debugVariablesEl.textContent = '';
+    debugPrevButton.disabled = true;
+    debugNextButton.disabled = true;
+    return;
+  }
+
+  debugHint.hidden = true;
+  debugPanel.hidden = false;
+  debugIndex = 0;
+  renderDebugStep();
+});
+
+debugPrevButton.addEventListener('click', () => {
+  if (debugIndex <= 0) {
+    return;
+  }
+  debugIndex -= 1;
+  renderDebugStep();
+});
+
+debugNextButton.addEventListener('click', () => {
+  if (debugIndex >= debugSteps.length - 1) {
+    return;
+  }
+  debugIndex += 1;
+  renderDebugStep();
+});
+
 resetButton.addEventListener('click', () => {
   editor.value = defaultProgram;
   outputEl.textContent = '';
   messagesEl.textContent = '';
+  clearDebugPanel();
 });
+
+function clearDebugPanel() {
+  debugSteps = [];
+  debugIndex = -1;
+  debugPanel.hidden = true;
+  debugHint.hidden = false;
+  debugHint.textContent =
+    'Presiona Depurar para analizar el programa paso a paso.';
+  debugStatementEl.textContent = '';
+  debugOutputEl.textContent = '';
+  debugVariablesEl.textContent = '';
+  debugPositionEl.textContent = 'Paso 0 de 0';
+  debugPrevButton.disabled = true;
+  debugNextButton.disabled = true;
+}
+
+function renderDebugStep() {
+  if (!debugSteps.length || debugIndex < 0 || debugIndex >= debugSteps.length) {
+    return;
+  }
+
+  const step = debugSteps[debugIndex];
+  debugStatementEl.textContent = step.description;
+  debugOutputEl.textContent = step.output || '';
+  debugVariablesEl.textContent = formatVariablesForDisplay(step.variables);
+  debugPositionEl.textContent = `Paso ${debugIndex + 1} de ${debugSteps.length}`;
+  debugPrevButton.disabled = debugIndex === 0;
+  debugNextButton.disabled = debugIndex === debugSteps.length - 1;
+}
+
+function formatVariablesForDisplay(variablesSnapshot) {
+  if (!variablesSnapshot.length) {
+    return '(Sin variables declaradas)';
+  }
+
+  const lines = [];
+  for (const variable of variablesSnapshot) {
+    const name = variable.name.toUpperCase();
+    if (variable.kind === 'table') {
+      const elementType = variable.elementType.toUpperCase();
+      lines.push(`${name} (TABLA DE ${elementType}) [${variable.rows.length}]`);
+      if (!variable.rows.length) {
+        lines.push('  [vacía]');
+      } else {
+        variable.rows.forEach((row, index) => {
+          const entryValue = formatDisplayValue(row.value);
+          lines.push(`  [${index + 1}] (${row.type.toUpperCase()}) = ${entryValue}`);
+        });
+      }
+      continue;
+    }
+
+    const typeLabel = variable.type.toUpperCase();
+    const value = formatDisplayValue(variable.value);
+    lines.push(`${name} (${typeLabel}) = ${value}`);
+  }
+
+  return lines.join('\n');
+}
+
+function formatDisplayValue(value) {
+  if (typeof value === 'string') {
+    return JSON.stringify(value);
+  }
+  if (value === null || value === undefined) {
+    return String(value);
+  }
+  return String(value);
+}
+
+function formatOutputLines(outputLines) {
+  return outputLines
+    .filter((line, index, arr) => !(index === arr.length - 1 && line === ''))
+    .map((line) => line.trimEnd())
+    .join('\n');
+}
 
 function executeAbap(code) {
   const variables = new Map();
@@ -49,12 +183,64 @@ function executeAbap(code) {
 
   executeSequence(statements, variables, outputLines, messages);
 
-  const printableOutput = outputLines
-    .filter((line, index, arr) => !(index === arr.length - 1 && line === ''))
-    .map((line) => line.trimEnd())
-    .join('\n');
+  const printableOutput = formatOutputLines(outputLines);
 
   return { output: printableOutput, messages };
+}
+
+function collectDebugSteps(code) {
+  const variables = new Map();
+  const outputLines = [''];
+  const messages = [];
+  const steps = [createDebugSnapshot('Estado inicial', variables, outputLines)];
+
+  let statements;
+  try {
+    statements = preprocess(code);
+  } catch (error) {
+    return { steps, output: '', messages: [error.message] };
+  }
+
+  executeSequence(statements, variables, outputLines, messages, (snapshot) => {
+    steps.push(snapshot);
+  });
+
+  const printableOutput = formatOutputLines(outputLines);
+
+  return { steps, output: printableOutput, messages };
+}
+
+function createDebugSnapshot(description, variables, outputLines) {
+  return {
+    description,
+    output: formatOutputLines(outputLines),
+    variables: serializeVariables(variables),
+  };
+}
+
+function serializeVariables(variables) {
+  const snapshot = [];
+  for (const [name, data] of variables.entries()) {
+    if (data.type === 'table') {
+      snapshot.push({
+        name,
+        kind: 'table',
+        elementType: data.element.type,
+        rows: data.value.map((entry) => ({ type: entry.type, value: entry.value })),
+      });
+      continue;
+    }
+
+    snapshot.push({
+      name,
+      kind: 'scalar',
+      type: data.type,
+      value: data.value,
+    });
+  }
+
+  snapshot.sort((a, b) => a.name.localeCompare(b.name));
+  return snapshot;
 }
 
 function preprocess(code) {
@@ -293,27 +479,30 @@ function preprocess(code) {
   return root.children;
 }
 
-function executeSequence(nodes, variables, outputLines, messages) {
+function executeSequence(nodes, variables, outputLines, messages, observer) {
   for (const node of nodes) {
     try {
-      processNode(node, variables, outputLines, messages);
+      processNode(node, variables, outputLines, messages, observer);
     } catch (error) {
       messages.push(error.message);
     }
   }
 }
 
-function processNode(node, variables, outputLines, messages) {
+function processNode(node, variables, outputLines, messages, observer) {
   if (node.type === 'statement') {
     executeStatement(node.raw, variables, outputLines);
+    if (observer) {
+      observer(createDebugSnapshot(node.raw, variables, outputLines));
+    }
     return;
   }
   if (node.type === 'if') {
-    handleIf(node, variables, outputLines, messages);
+    handleIf(node, variables, outputLines, messages, observer);
     return;
   }
   if (node.type === 'loop') {
-    handleLoop(node, variables, outputLines, messages);
+    handleLoop(node, variables, outputLines, messages, observer);
     return;
   }
   throw new Error(`Tipo de nodo desconocido: ${node.type}`);
@@ -354,20 +543,20 @@ function executeStatement(statement, variables, outputLines) {
   throw new Error(`Instrucción no soportada: "${statement}"`);
 }
 
-function handleIf(node, variables, outputLines, messages) {
+function handleIf(node, variables, outputLines, messages, observer) {
   for (const clause of node.clauses) {
     if (evaluateCondition(clause.condition, variables)) {
-      executeSequence(clause.statements, variables, outputLines, messages);
+      executeSequence(clause.statements, variables, outputLines, messages, observer);
       return;
     }
   }
 
   if (node.elseStatements.length) {
-    executeSequence(node.elseStatements, variables, outputLines, messages);
+    executeSequence(node.elseStatements, variables, outputLines, messages, observer);
   }
 }
 
-function handleLoop(node, variables, outputLines, messages) {
+function handleLoop(node, variables, outputLines, messages, observer) {
   if (node.loopType === 'table') {
     const table = variables.get(node.tableName);
     if (!table) {
@@ -388,7 +577,7 @@ function handleLoop(node, variables, outputLines, messages) {
     const elementMetadata = table.element;
     const elementIsNumeric = isNumericType(elementMetadata.type);
 
-    for (const entry of table.value) {
+    table.value.forEach((entry, index) => {
       if (elementIsNumeric && !isNumericType(target.type)) {
         throw new Error('El destino del LOOP AT debe ser numérico para tablas numéricas.');
       }
@@ -402,8 +591,12 @@ function handleLoop(node, variables, outputLines, messages) {
         target,
         `asignado durante LOOP AT ${node.tableIdentifier}`,
       );
-      executeSequence(node.body, variables, outputLines, messages);
-    }
+      if (observer) {
+        const iterationLabel = `${node.header} [iteración ${index + 1}]`;
+        observer(createDebugSnapshot(iterationLabel, variables, outputLines));
+      }
+      executeSequence(node.body, variables, outputLines, messages, observer);
+    });
     return;
   }
 
@@ -421,7 +614,11 @@ function handleLoop(node, variables, outputLines, messages) {
   }
 
   for (let i = 0; i < iterations; i += 1) {
-    executeSequence(node.body, variables, outputLines, messages);
+    if (observer) {
+      const iterationLabel = `${node.header} [iteración ${i + 1} de ${iterations}]`;
+      observer(createDebugSnapshot(iterationLabel, variables, outputLines));
+    }
+    executeSequence(node.body, variables, outputLines, messages, observer);
   }
 }
 
