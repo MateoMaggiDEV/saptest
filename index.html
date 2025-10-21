@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mini entorno ABAP local</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <header class="layout__header">
+        <h1>Ejecutor ABAP local</h1>
+        <p>
+          Escribe tu código ABAP en el panel izquierdo y presiona
+          <strong>Ejecutar</strong> para simular su comportamiento de forma local.
+          El intérprete soporta un subconjunto de instrucciones como
+          <code>DATA</code>, <code>WRITE</code>, asignaciones, <code>ADD</code> y
+          <code>SUBTRACT</code>.
+        </p>
+      </header>
+      <section class="layout__workspace">
+        <section class="editor">
+          <div class="editor__toolbar">
+            <div class="toolbar__group">
+              <button id="runButton" type="button">Ejecutar</button>
+              <button id="resetButton" type="button">Restablecer</button>
+            </div>
+            <span class="toolbar__hint">Los comentarios con <code>*</code> o <code>"</code> son ignorados.</span>
+          </div>
+          <textarea id="abapEditor" spellcheck="false"></textarea>
+        </section>
+        <section class="output">
+          <h2>Salida</h2>
+          <pre id="output"></pre>
+          <h2>Mensajes</h2>
+          <pre id="messages"></pre>
+        </section>
+      </section>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>
