@@ -103,18 +103,24 @@ function handleData(statement, variables) {
     }
 
     const { name, type } = match.groups;
-    let value = match.groups.value ? evaluateExpression(match.groups.value, variables) : undefined;
+    const normalizedType = type.toLowerCase();
+    let value;
 
-    if (type.toLowerCase() === 'i') {
-      value = value !== undefined ? Number(value) : 0;
-      if (Number.isNaN(value)) {
-        throw new Error(`El valor inicial de ${name} debe ser numérico.`);
+    if (match.groups.value !== undefined) {
+      const evaluation = evaluateExpression(match.groups.value, variables);
+      if (normalizedType === 'i') {
+        if (evaluation.type !== 'number') {
+          throw new Error(`El valor inicial de ${name} debe ser numérico.`);
+        }
+        value = evaluation.value;
+      } else {
+        value = convertToString(evaluation);
       }
     } else {
-      value = value !== undefined ? String(value) : '';
+      value = normalizedType === 'i' ? 0 : '';
     }
 
-    variables.set(name.toLowerCase(), { type: type.toLowerCase(), value });
+    variables.set(name.toLowerCase(), { type: normalizedType, value });
   }
 }
 
@@ -135,8 +141,8 @@ function handleWrite(statement, variables, outputLines) {
       segment = segment.slice(1).trim();
     }
 
-    const value = evaluateExpression(segment, variables);
-    appendOutput(String(value), newline, outputLines);
+    const evaluation = evaluateExpression(segment, variables);
+    appendOutput(convertToString(evaluation), newline, outputLines);
   }
 }
 
@@ -162,7 +168,11 @@ function handleAdd(statement, variables) {
     throw new Error(`Sintaxis ADD inválida: "${statement}"`);
   }
 
-  const amount = Number(evaluateExpression(match[1], variables));
+  const amountEvaluation = evaluateExpression(match[1], variables);
+  if (amountEvaluation.type !== 'number') {
+    throw new Error('ADD requiere un valor numérico.');
+  }
+  const amount = amountEvaluation.value;
   const targetName = match[2].toLowerCase();
   const target = variables.get(targetName);
 
@@ -171,9 +181,6 @@ function handleAdd(statement, variables) {
   }
   if (target.type !== 'i') {
     throw new Error('ADD solo admite variables de tipo I.');
-  }
-  if (Number.isNaN(amount)) {
-    throw new Error('ADD requiere un valor numérico.');
   }
 
   target.value += amount;
@@ -185,7 +192,11 @@ function handleSubtract(statement, variables) {
     throw new Error(`Sintaxis SUBTRACT inválida: "${statement}"`);
   }
 
-  const amount = Number(evaluateExpression(match[1], variables));
+  const amountEvaluation = evaluateExpression(match[1], variables);
+  if (amountEvaluation.type !== 'number') {
+    throw new Error('SUBTRACT requiere un valor numérico.');
+  }
+  const amount = amountEvaluation.value;
   const targetName = match[2].toLowerCase();
   const target = variables.get(targetName);
 
@@ -194,9 +205,6 @@ function handleSubtract(statement, variables) {
   }
   if (target.type !== 'i') {
     throw new Error('SUBTRACT solo admite variables de tipo I.');
-  }
-  if (Number.isNaN(amount)) {
-    throw new Error('SUBTRACT requiere un valor numérico.');
   }
 
   target.value -= amount;
@@ -227,38 +235,324 @@ function handleAssignment(statement, variables) {
     throw new Error(`Variable "${match[1]}" no declarada.`);
   }
 
-  let value = evaluateExpression(match[2], variables);
+  const evaluation = evaluateExpression(match[2], variables);
   if (variable.type === 'i') {
-    value = Number(value);
-    if (Number.isNaN(value)) {
+    if (evaluation.type !== 'number') {
       throw new Error(`La variable ${match[1]} requiere un valor numérico.`);
     }
+    variable.value = evaluation.value;
   } else {
-    value = String(value);
+    variable.value = convertToString(evaluation);
   }
-
-  variable.value = value;
 }
 
 function evaluateExpression(expression, variables) {
-  const trimmed = expression.trim();
-  if (!trimmed) {
+  const tokens = tokenizeExpression(expression);
+  if (!tokens.length) {
     throw new Error('Expresión vacía.');
   }
 
-  if ((trimmed.startsWith("'") && trimmed.endsWith("'")) || (trimmed.startsWith('`') && trimmed.endsWith('`'))) {
-    return trimmed.slice(1, -1);
+  let position = 0;
+
+  function peek() {
+    return tokens[position];
   }
 
-  const numeric = Number(trimmed);
-  if (!Number.isNaN(numeric)) {
-    return numeric;
+  function consume() {
+    return tokens[position++];
   }
 
-  const variable = variables.get(trimmed.toLowerCase());
-  if (variable) {
-    return variable.value;
+  function matchOperator(...operators) {
+    const token = peek();
+    if (token && token.type === 'operator' && operators.includes(token.value)) {
+      position++;
+      return token.value;
+    }
+    return null;
   }
 
-  throw new Error(`No se pudo evaluar la expresión: "${expression}"`);
+  function expectClosingParen() {
+    const token = peek();
+    if (!token || token.type !== 'paren' || token.value !== ')') {
+      throw new Error('Falta paréntesis de cierre.');
+    }
+    consume();
+  }
+
+  function parsePrimary() {
+    const token = peek();
+    if (!token) {
+      throw new Error('Expresión incompleta.');
+    }
+
+    if (token.type === 'number' || token.type === 'string') {
+      consume();
+      return { type: token.type === 'number' ? 'number' : 'string', value: token.value };
+    }
+
+    if (token.type === 'identifier') {
+      consume();
+      const variable = variables.get(token.value.toLowerCase());
+      if (!variable) {
+        throw new Error(`Variable "${token.value}" no declarada.`);
+      }
+      if (variable.type === 'i') {
+        return { type: 'number', value: Number(variable.value) };
+      }
+      return { type: 'string', value: String(variable.value) };
+    }
+
+    if (token.type === 'paren' && token.value === '(') {
+      consume();
+      const value = parseComparison();
+      expectClosingParen();
+      return value;
+    }
+
+    if (token.type === 'paren' && token.value === ')') {
+      throw new Error('Paréntesis de cierre inesperado.');
+    }
+
+    throw new Error(`Token inesperado en la expresión: "${token.value}"`);
+  }
+
+  function parseUnary() {
+    const operator = matchOperator('+', '-');
+    if (operator) {
+      const operand = parseUnary();
+      if (operand.type !== 'number') {
+        throw new Error(`El operador unario ${operator} solo admite números.`);
+      }
+      return { type: 'number', value: operator === '-' ? -operand.value : operand.value };
+    }
+    return parsePrimary();
+  }
+
+  function parseMultiplicative() {
+    let left = parseUnary();
+    while (true) {
+      const operator = matchOperator('*', '/');
+      if (!operator) {
+        break;
+      }
+      const right = parseUnary();
+      if (left.type !== 'number' || right.type !== 'number') {
+        throw new Error('Las operaciones aritméticas solo admiten números.');
+      }
+      if (operator === '*') {
+        left = { type: 'number', value: left.value * right.value };
+      } else {
+        left = { type: 'number', value: left.value / right.value };
+      }
+    }
+    return left;
+  }
+
+  function parseAdditive() {
+    let left = parseMultiplicative();
+    while (true) {
+      const operator = matchOperator('+', '-');
+      if (!operator) {
+        break;
+      }
+      const right = parseMultiplicative();
+      if (left.type !== 'number' || right.type !== 'number') {
+        throw new Error('Las operaciones aritméticas solo admiten números.');
+      }
+      left = {
+        type: 'number',
+        value: operator === '+' ? left.value + right.value : left.value - right.value,
+      };
+    }
+    return left;
+  }
+
+  function parseComparison() {
+    let left = parseAdditive();
+    const operator = matchOperator('=', '<>', '>', '<');
+    if (!operator) {
+      return left;
+    }
+
+    const right = parseAdditive();
+
+    if (operator === '=' || operator === '<>') {
+      if (left.type !== right.type) {
+        throw new Error('La comparación requiere operandos del mismo tipo.');
+      }
+      const result = operator === '=' ? left.value === right.value : left.value !== right.value;
+      return { type: 'boolean', value: result };
+    }
+
+    if (left.type !== 'number' || right.type !== 'number') {
+      throw new Error(`El operador ${operator} solo admite números.`);
+    }
+
+    const result = operator === '>' ? left.value > right.value : left.value < right.value;
+    return { type: 'boolean', value: result };
+  }
+
+  const result = parseComparison();
+  if (position < tokens.length) {
+    throw new Error('No se pudo interpretar la expresión completa.');
+  }
+  return result;
+}
+
+function tokenizeExpression(expression) {
+  const tokens = [];
+  let index = 0;
+
+  const trimmed = expression.trim();
+  if (!trimmed) {
+    return tokens;
+  }
+
+  function isDigit(char) {
+    return /[0-9]/.test(char);
+  }
+
+  function isIdentifierStart(char) {
+    return /[a-zA-Z_]/.test(char);
+  }
+
+  function isIdentifierPart(char) {
+    return /[a-zA-Z0-9_-]/.test(char);
+  }
+
+  while (index < expression.length) {
+    const char = expression[index];
+
+    if (/\s/.test(char)) {
+      index += 1;
+      continue;
+    }
+
+    if (char === "'" || char === '`') {
+      const quote = char;
+      index += 1;
+      let value = '';
+      let closed = false;
+      while (index < expression.length) {
+        const current = expression[index];
+        if (current === quote) {
+          closed = true;
+          index += 1;
+          break;
+        }
+        value += current;
+        index += 1;
+      }
+      if (!closed) {
+        throw new Error('Literal de cadena sin cerrar.');
+      }
+      tokens.push({ type: 'string', value });
+      continue;
+    }
+
+    if (isDigit(char) || (char === '.' && isDigit(expression[index + 1] || ''))) {
+      const start = index;
+      let hasDot = char === '.';
+      index += 1;
+      while (index < expression.length) {
+        const current = expression[index];
+        if (current === '.') {
+          if (hasDot) {
+            break;
+          }
+          const next = expression[index + 1];
+          if (!isDigit(next || '')) {
+            break;
+          }
+          hasDot = true;
+          index += 1;
+          continue;
+        }
+        if (!isDigit(current)) {
+          break;
+        }
+        index += 1;
+      }
+      const numericValue = Number(expression.slice(start, index));
+      if (Number.isNaN(numericValue)) {
+        throw new Error(`Número inválido en la expresión: "${expression.slice(start, index)}"`);
+      }
+      tokens.push({ type: 'number', value: numericValue });
+      continue;
+    }
+
+    if (isIdentifierStart(char)) {
+      const start = index;
+      index += 1;
+      while (index < expression.length && isIdentifierPart(expression[index])) {
+        index += 1;
+      }
+      const identifier = expression.slice(start, index);
+      tokens.push({ type: 'identifier', value: identifier });
+      continue;
+    }
+
+    if (char === '+' || char === '-' || char === '*' || char === '/') {
+      tokens.push({ type: 'operator', value: char });
+      index += 1;
+      continue;
+    }
+
+    if (char === '(' || char === ')') {
+      tokens.push({ type: 'paren', value: char });
+      index += 1;
+      continue;
+    }
+
+    if (char === '=') {
+      if (expression[index + 1] === '=') {
+        throw new Error('Operador no soportado: ==');
+      }
+      tokens.push({ type: 'operator', value: '=' });
+      index += 1;
+      continue;
+    }
+
+    if (char === '<') {
+      const next = expression[index + 1];
+      if (next === '>') {
+        tokens.push({ type: 'operator', value: '<>' });
+        index += 2;
+        continue;
+      }
+      if (next === '=') {
+        throw new Error('Operador no soportado: <=');
+      }
+      tokens.push({ type: 'operator', value: '<' });
+      index += 1;
+      continue;
+    }
+
+    if (char === '>') {
+      if (expression[index + 1] === '=') {
+        throw new Error('Operador no soportado: >=');
+      }
+      tokens.push({ type: 'operator', value: '>' });
+      index += 1;
+      continue;
+    }
+
+    if (char === '!') {
+      if (expression[index + 1] === '=') {
+        throw new Error('Operador no soportado: !=');
+      }
+      throw new Error('Operador no soportado: !');
+    }
+
+    throw new Error(`Carácter no reconocido en la expresión: "${char}"`);
+  }
+
+  return tokens;
+}
+
+function convertToString(evaluation) {
+  if (evaluation.type === 'boolean') {
+    return evaluation.value ? 'TRUE' : 'FALSE';
+  }
+  return String(evaluation.value);
 }
