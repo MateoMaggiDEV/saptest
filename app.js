@@ -1,10 +1,18 @@
-const defaultProgram = `* Ejemplo básico ABAP
+const defaultProgram = `* Ejemplo de variables simples e internas
 DATA: lv_text TYPE string VALUE 'Hola mundo',
-      lv_num  TYPE i VALUE 5.
+      lv_num  TYPE i VALUE 5,
+      lt_texts TYPE TABLE OF string.
+
+APPEND lv_text TO lt_texts.
+APPEND 'Adiós' TO lt_texts.
 
 WRITE: / 'Mensaje:', lv_text.
 ADD 3 TO lv_num.
-WRITE: / 'Resultado:', lv_num.`;
+WRITE: / 'Resultado:', lv_num.
+
+LOOP AT lt_texts INTO lv_text.
+  WRITE: / 'Tabla:', lv_text.
+ENDLOOP.`;
 
 const editor = document.getElementById('abapEditor');
 const outputEl = document.getElementById('output');
@@ -198,7 +206,35 @@ function preprocess(code) {
           throw new Error('DO TIMES requiere una expresión numérica.');
         }
       }
-      const node = { type: 'loop', keyword: 'DO', header: token, countExpression, body: [] };
+      const node = {
+        type: 'loop',
+        keyword: 'DO',
+        header: token,
+        loopType: 'count',
+        countExpression,
+        body: [],
+      };
+      getActiveChildren(currentFrame).push(node);
+      stack.push({ node, branch: 'body' });
+      continue;
+    }
+
+    if (/^LOOP\s+AT\b/.test(upper)) {
+      const match = token.match(/^LOOP\s+AT\s+([a-z_][\w-]*)\s+INTO\s+([a-z_][\w-]*)$/i);
+      if (!match) {
+        throw new Error('Esta versión solo admite LOOP AT <tabla> INTO <variable>.');
+      }
+      const node = {
+        type: 'loop',
+        keyword: 'LOOP',
+        header: token,
+        loopType: 'table',
+        tableName: match[1].toLowerCase(),
+        tableIdentifier: match[1],
+        intoName: match[2].toLowerCase(),
+        intoIdentifier: match[2],
+        body: [],
+      };
       getActiveChildren(currentFrame).push(node);
       stack.push({ node, branch: 'body' });
       continue;
@@ -217,7 +253,14 @@ function preprocess(code) {
       if (!countExpression) {
         throw new Error('LOOP TIMES requiere una expresión numérica.');
       }
-      const node = { type: 'loop', keyword: 'LOOP', header: token, countExpression, body: [] };
+      const node = {
+        type: 'loop',
+        keyword: 'LOOP',
+        header: token,
+        loopType: 'count',
+        countExpression,
+        body: [],
+      };
       getActiveChildren(currentFrame).push(node);
       stack.push({ node, branch: 'body' });
       continue;
@@ -297,6 +340,10 @@ function executeStatement(statement, variables, outputLines) {
     handleClear(statement, variables);
     return;
   }
+  if (/^APPEND\b/i.test(statement)) {
+    handleAppend(statement, variables);
+    return;
+  }
   if (/^[a-z_][\w-]*\s*=/.test(statement)) {
     handleAssignment(statement, variables);
     return;
@@ -321,15 +368,49 @@ function handleIf(node, variables, outputLines, messages) {
 }
 
 function handleLoop(node, variables, outputLines, messages) {
+  if (node.loopType === 'table') {
+    const table = variables.get(node.tableName);
+    if (!table) {
+      throw new Error(`Tabla interna "${node.tableIdentifier}" no declarada.`);
+    }
+    if (table.type !== 'table') {
+      throw new Error(`"${node.tableIdentifier}" no es una tabla interna.`);
+    }
+
+    const target = variables.get(node.intoName);
+    if (!target) {
+      throw new Error(`Variable "${node.intoIdentifier}" no declarada para LOOP AT.`);
+    }
+    if (target.type === 'table') {
+      throw new Error('LOOP AT INTO no admite asignar el resultado a otra tabla interna.');
+    }
+
+    for (const entry of table.value) {
+      if (table.elementType === 'i') {
+        if (target.type !== 'i') {
+          throw new Error('El destino del LOOP AT debe ser de tipo I para tablas numéricas.');
+        }
+        target.value = entry.value;
+      } else {
+        if (target.type === 'i') {
+          throw new Error('El destino del LOOP AT no puede ser numérico para tablas de texto.');
+        }
+        target.value = entry.value;
+      }
+      executeSequence(node.body, variables, outputLines, messages);
+    }
+    return;
+  }
+
   if (!node.countExpression) {
     throw new Error(`${node.keyword} sin TIMES no está soportado en esta versión.`);
   }
 
-  const countValue = evaluateExpression(node.countExpression, variables);
-  const iterations = Number(countValue);
-  if (!Number.isFinite(iterations) || Number.isNaN(iterations)) {
+  const countEvaluation = evaluateExpression(node.countExpression, variables);
+  if (countEvaluation.type !== 'number') {
     throw new Error(`El número de iteraciones para ${node.keyword} debe ser numérico.`);
   }
+  const iterations = countEvaluation.value;
   if (!Number.isInteger(iterations) || iterations < 0) {
     throw new Error(`El número de iteraciones para ${node.keyword} debe ser un entero positivo.`);
   }
@@ -354,16 +435,14 @@ function evaluateCondition(condition, variables) {
       throw new Error('La comparación IF requiere operandos a ambos lados del operador.');
     }
 
-    const leftValue = evaluateExpression(leftExpression, variables);
-    const rightValue = evaluateExpression(rightExpression, variables);
+    const leftEvaluation = evaluateExpression(leftExpression, variables);
+    const rightEvaluation = evaluateExpression(rightExpression, variables);
 
-    const leftNumber = Number(leftValue);
-    const rightNumber = Number(rightValue);
-    const bothNumeric = !Number.isNaN(leftNumber) && !Number.isNaN(rightNumber);
+    const bothNumeric = leftEvaluation.type === 'number' && rightEvaluation.type === 'number';
 
     const [leftComparable, rightComparable] = bothNumeric
-      ? [leftNumber, rightNumber]
-      : [String(leftValue), String(rightValue)];
+      ? [leftEvaluation.value, rightEvaluation.value]
+      : [convertToString(leftEvaluation), convertToString(rightEvaluation)];
 
     switch (operator) {
       case '=':
@@ -371,23 +450,38 @@ function evaluateCondition(condition, variables) {
       case '<>':
         return leftComparable !== rightComparable;
       case '>':
+        if (!bothNumeric) {
+          throw new Error('El operador > solo admite números.');
+        }
         return leftComparable > rightComparable;
       case '<':
+        if (!bothNumeric) {
+          throw new Error('El operador < solo admite números.');
+        }
         return leftComparable < rightComparable;
       case '>=':
+        if (!bothNumeric) {
+          throw new Error('El operador >= solo admite números.');
+        }
         return leftComparable >= rightComparable;
       case '<=':
+        if (!bothNumeric) {
+          throw new Error('El operador <= solo admite números.');
+        }
         return leftComparable <= rightComparable;
       default:
         throw new Error(`Operador de comparación no soportado: ${operator}`);
     }
   }
 
-  const value = evaluateExpression(trimmed, variables);
-  if (typeof value === 'number') {
-    return value !== 0;
+  const evaluation = evaluateExpression(trimmed, variables);
+  if (evaluation.type === 'number') {
+    return evaluation.value !== 0;
   }
-  return Boolean(value);
+  if (evaluation.type === 'boolean') {
+    return evaluation.value;
+  }
+  return convertToString(evaluation).length > 0;
 }
 
 function handleData(statement, variables) {
@@ -399,17 +493,31 @@ function handleData(statement, variables) {
   const declarations = body.split(',').map((part) => part.trim()).filter(Boolean);
 
   for (const declaration of declarations) {
-    const match = declaration.match(/^(?<name>[a-z_][\w-]*)\s+TYPE\s+(?<type>i|string)(?:\s+VALUE\s+(?<value>.+))?$/i);
+    const match = declaration.match(/^(?<name>[a-z_][\w-]*)\s+TYPE\s+(?<definition>.+)$/i);
     if (!match) {
       throw new Error(`No se pudo interpretar la declaración: "${declaration}"`);
     }
 
-    const { name, type } = match.groups;
-    const normalizedType = type.toLowerCase();
+    const name = match.groups.name;
+    const definition = match.groups.definition.trim();
+
+    const tableMatch = definition.match(/^(?:(?:STANDARD|HASHED|SORTED)\s+)?TABLE\s+OF\s+(?<element>i|string)(?:\s+WITH\s+EMPTY\s+KEY)?$/i);
+    if (tableMatch) {
+      const elementType = tableMatch.groups.element.toLowerCase();
+      variables.set(name.toLowerCase(), { type: 'table', elementType, value: [] });
+      continue;
+    }
+
+    const simpleMatch = definition.match(/^(?<type>i|string)(?:\s+VALUE\s+(?<value>.+))?$/i);
+    if (!simpleMatch) {
+      throw new Error(`No se pudo interpretar la declaración: "${declaration}"`);
+    }
+
+    const normalizedType = simpleMatch.groups.type.toLowerCase();
     let value;
 
-    if (match.groups.value !== undefined) {
-      const evaluation = evaluateExpression(match.groups.value, variables);
+    if (simpleMatch.groups.value !== undefined) {
+      const evaluation = evaluateExpression(simpleMatch.groups.value, variables);
       if (normalizedType === 'i') {
         if (evaluation.type !== 'number') {
           throw new Error(`El valor inicial de ${name} debe ser numérico.`);
@@ -522,7 +630,39 @@ function handleClear(statement, variables) {
   if (!variable) {
     throw new Error(`Variable "${match[1]}" no declarada.`);
   }
+  if (variable.type === 'table') {
+    variable.value = [];
+    return;
+  }
   variable.value = variable.type === 'i' ? 0 : '';
+}
+
+function handleAppend(statement, variables) {
+  const match = statement.match(/^APPEND\s+(.+)\s+TO\s+([a-z_][\w-]*)$/i);
+  if (!match) {
+    throw new Error(`Sintaxis APPEND inválida: "${statement}"`);
+  }
+
+  const valueEvaluation = evaluateExpression(match[1], variables);
+  const tableName = match[2].toLowerCase();
+  const table = variables.get(tableName);
+
+  if (!table) {
+    throw new Error(`Tabla interna "${match[2]}" no declarada.`);
+  }
+  if (table.type !== 'table') {
+    throw new Error(`"${match[2]}" no es una tabla interna.`);
+  }
+
+  if (table.elementType === 'i') {
+    if (valueEvaluation.type !== 'number') {
+      throw new Error('APPEND requiere un valor numérico para tablas de tipo I.');
+    }
+    table.value.push({ type: 'number', value: valueEvaluation.value });
+    return;
+  }
+
+  table.value.push({ type: 'string', value: convertToString(valueEvaluation) });
 }
 
 function handleAssignment(statement, variables) {
@@ -535,6 +675,10 @@ function handleAssignment(statement, variables) {
   const variable = variables.get(name);
   if (!variable) {
     throw new Error(`Variable "${match[1]}" no declarada.`);
+  }
+
+  if (variable.type === 'table') {
+    throw new Error('La asignación directa a tablas internas no está soportada en esta versión.');
   }
 
   const evaluation = evaluateExpression(match[2], variables);
@@ -600,6 +744,9 @@ function evaluateExpression(expression, variables) {
       }
       if (variable.type === 'i') {
         return { type: 'number', value: Number(variable.value) };
+      }
+      if (variable.type === 'table') {
+        throw new Error('Las tablas internas no pueden utilizarse en expresiones.');
       }
       return { type: 'string', value: String(variable.value) };
     }
