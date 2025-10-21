@@ -32,31 +32,14 @@ function executeAbap(code) {
   const outputLines = [''];
   const messages = [];
 
-  const statements = preprocess(code);
-
-  for (const statement of statements) {
-    try {
-      if (/^DATA\b/i.test(statement)) {
-        handleData(statement, variables);
-      } else if (/^WRITE\b/i.test(statement)) {
-        handleWrite(statement, variables, outputLines);
-      } else if (/^ADD\b/i.test(statement)) {
-        handleAdd(statement, variables);
-      } else if (/^SUBTRACT\b/i.test(statement)) {
-        handleSubtract(statement, variables);
-      } else if (/^CLEAR\b/i.test(statement)) {
-        handleClear(statement, variables);
-      } else if (/^[a-z_][\w-]*\s*=/.test(statement)) {
-        handleAssignment(statement, variables);
-      } else if (statement.trim().length === 0) {
-        continue;
-      } else {
-        messages.push(`Instrucción no soportada: "${statement}"`);
-      }
-    } catch (error) {
-      messages.push(error.message);
-    }
+  let statements;
+  try {
+    statements = preprocess(code);
+  } catch (error) {
+    return { output: '', messages: [error.message] };
   }
+
+  executeSequence(statements, variables, outputLines, messages);
 
   const printableOutput = outputLines
     .filter((line, index, arr) => !(index === arr.length - 1 && line === ''))
@@ -82,10 +65,329 @@ function preprocess(code) {
     })
     .join('\n');
 
-  return sanitized
+  const tokens = sanitized
     .split('.')
     .map((statement) => statement.replace(/\s+/g, ' ').trim())
     .filter(Boolean);
+
+  const root = { type: 'block', children: [] };
+  const stack = [{ node: root, branch: 'children' }];
+
+  const getActiveChildren = (frame) => {
+    if (frame.node.type === 'block') {
+      return frame.node.children;
+    }
+    if (frame.node.type === 'if') {
+      if (frame.branch.type === 'clause') {
+        return frame.node.clauses[frame.branch.index].statements;
+      }
+      if (frame.branch === 'else') {
+        return frame.node.elseStatements;
+      }
+    }
+    if (frame.node.type === 'loop') {
+      return frame.node.body;
+    }
+    throw new Error('Estado interno inválido durante el preprocesado.');
+  };
+
+  const ensureIfFrame = () => {
+    if (stack.length <= 1) {
+      throw new Error('Se encontró un bloque IF/ELSE sin apertura correspondiente.');
+    }
+    const frame = stack[stack.length - 1];
+    if (frame.node.type !== 'if') {
+      throw new Error('La sentencia de control no coincide con un bloque IF activo.');
+    }
+    return frame;
+  };
+
+  const closeLoop = (keyword, closing) => {
+    if (stack.length <= 1) {
+      throw new Error(`${closing} sin bloque de apertura.`);
+    }
+    const frame = stack[stack.length - 1];
+    if (frame.node.type !== 'loop') {
+      throw new Error(`${closing} no coincide con el bloque abierto actual.`);
+    }
+    if (frame.node.keyword !== keyword) {
+      throw new Error(`${closing} no coincide con el bloque ${keyword} abierto más reciente.`);
+    }
+    stack.pop();
+  };
+
+  const closeBlock = (type, closingKeyword) => {
+    if (stack.length <= 1) {
+      throw new Error(`${closingKeyword} sin bloque de apertura.`);
+    }
+    const frame = stack[stack.length - 1];
+    if (frame.node.type !== type) {
+      throw new Error(`${closingKeyword} no coincide con el bloque abierto actual.`);
+    }
+    stack.pop();
+  };
+
+  for (const token of tokens) {
+    const upper = token.toUpperCase();
+    const currentFrame = stack[stack.length - 1];
+
+    if (/^IF\b/.test(upper)) {
+      const condition = token
+        .replace(/^IF\s*/i, '')
+        .replace(/\s+THEN$/i, '')
+        .trim();
+      if (!condition) {
+        throw new Error('La sentencia IF requiere una condición.');
+      }
+      const node = {
+        type: 'if',
+        header: token,
+        clauses: [{ condition, statements: [] }],
+        elseStatements: [],
+      };
+      getActiveChildren(currentFrame).push(node);
+      stack.push({ node, branch: { type: 'clause', index: 0 } });
+      continue;
+    }
+
+    if (/^ELSEIF\b/.test(upper)) {
+      const frame = ensureIfFrame();
+      if (frame.branch === 'else') {
+        throw new Error('ELSEIF no puede aparecer después de un ELSE.');
+      }
+      const condition = token
+        .replace(/^ELSEIF\s*/i, '')
+        .replace(/\s+THEN$/i, '')
+        .trim();
+      if (!condition) {
+        throw new Error('La sentencia ELSEIF requiere una condición.');
+      }
+      const clause = { condition, statements: [] };
+      frame.node.clauses.push(clause);
+      frame.branch = { type: 'clause', index: frame.node.clauses.length - 1 };
+      continue;
+    }
+
+    if (upper === 'ELSE') {
+      const frame = ensureIfFrame();
+      if (frame.branch === 'else') {
+        throw new Error('El bloque ELSE ya fue definido para este IF.');
+      }
+      if (frame.node.elseStatements.length) {
+        throw new Error('El bloque ELSE ya fue definido para este IF.');
+      }
+      frame.branch = 'else';
+      continue;
+    }
+
+    if (upper === 'ENDIF') {
+      closeBlock('if', 'ENDIF');
+      continue;
+    }
+
+    if (/^DO\b/.test(upper)) {
+      const body = token.replace(/^DO\s*/i, '').trim();
+      let countExpression = null;
+      if (body.length) {
+        const match = body.match(/^(.*)\bTIMES$/i);
+        if (!match) {
+          throw new Error('Solo se admite la forma DO <n> TIMES en esta versión.');
+        }
+        countExpression = match[1].trim();
+        if (!countExpression) {
+          throw new Error('DO TIMES requiere una expresión numérica.');
+        }
+      }
+      const node = { type: 'loop', keyword: 'DO', header: token, countExpression, body: [] };
+      getActiveChildren(currentFrame).push(node);
+      stack.push({ node, branch: 'body' });
+      continue;
+    }
+
+    if (/^LOOP\b/.test(upper)) {
+      const body = token.replace(/^LOOP\s*/i, '').trim();
+      if (!body) {
+        throw new Error('LOOP requiere una expresión. Use LOOP <n> TIMES.');
+      }
+      const match = body.match(/^(.*)\bTIMES$/i);
+      if (!match) {
+        throw new Error('Solo se admite la forma LOOP <n> TIMES en esta versión simplificada.');
+      }
+      const countExpression = match[1].trim();
+      if (!countExpression) {
+        throw new Error('LOOP TIMES requiere una expresión numérica.');
+      }
+      const node = { type: 'loop', keyword: 'LOOP', header: token, countExpression, body: [] };
+      getActiveChildren(currentFrame).push(node);
+      stack.push({ node, branch: 'body' });
+      continue;
+    }
+
+    if (upper === 'ENDDO') {
+      closeLoop('DO', 'ENDDO');
+      continue;
+    }
+
+    if (upper === 'ENDLOOP') {
+      closeLoop('LOOP', 'ENDLOOP');
+      continue;
+    }
+
+    getActiveChildren(currentFrame).push({ type: 'statement', raw: token });
+  }
+
+  if (stack.length !== 1) {
+    const frame = stack[stack.length - 1];
+    if (frame.node.type === 'if') {
+      throw new Error(`Falta ENDIF para el bloque IF iniciado con "${frame.node.header}".`);
+    }
+    if (frame.node.type === 'loop') {
+      throw new Error(`Falta sentencia de cierre para el bloque ${frame.node.keyword} iniciado con "${frame.node.header}".`);
+    }
+    throw new Error('Faltan sentencias de cierre.');
+  }
+
+  return root.children;
+}
+
+function executeSequence(nodes, variables, outputLines, messages) {
+  for (const node of nodes) {
+    try {
+      processNode(node, variables, outputLines, messages);
+    } catch (error) {
+      messages.push(error.message);
+    }
+  }
+}
+
+function processNode(node, variables, outputLines, messages) {
+  if (node.type === 'statement') {
+    executeStatement(node.raw, variables, outputLines);
+    return;
+  }
+  if (node.type === 'if') {
+    handleIf(node, variables, outputLines, messages);
+    return;
+  }
+  if (node.type === 'loop') {
+    handleLoop(node, variables, outputLines, messages);
+    return;
+  }
+  throw new Error(`Tipo de nodo desconocido: ${node.type}`);
+}
+
+function executeStatement(statement, variables, outputLines) {
+  if (/^DATA\b/i.test(statement)) {
+    handleData(statement, variables);
+    return;
+  }
+  if (/^WRITE\b/i.test(statement)) {
+    handleWrite(statement, variables, outputLines);
+    return;
+  }
+  if (/^ADD\b/i.test(statement)) {
+    handleAdd(statement, variables);
+    return;
+  }
+  if (/^SUBTRACT\b/i.test(statement)) {
+    handleSubtract(statement, variables);
+    return;
+  }
+  if (/^CLEAR\b/i.test(statement)) {
+    handleClear(statement, variables);
+    return;
+  }
+  if (/^[a-z_][\w-]*\s*=/.test(statement)) {
+    handleAssignment(statement, variables);
+    return;
+  }
+  if (statement.trim().length === 0) {
+    return;
+  }
+  throw new Error(`Instrucción no soportada: "${statement}"`);
+}
+
+function handleIf(node, variables, outputLines, messages) {
+  for (const clause of node.clauses) {
+    if (evaluateCondition(clause.condition, variables)) {
+      executeSequence(clause.statements, variables, outputLines, messages);
+      return;
+    }
+  }
+
+  if (node.elseStatements.length) {
+    executeSequence(node.elseStatements, variables, outputLines, messages);
+  }
+}
+
+function handleLoop(node, variables, outputLines, messages) {
+  if (!node.countExpression) {
+    throw new Error(`${node.keyword} sin TIMES no está soportado en esta versión.`);
+  }
+
+  const countValue = evaluateExpression(node.countExpression, variables);
+  const iterations = Number(countValue);
+  if (!Number.isFinite(iterations) || Number.isNaN(iterations)) {
+    throw new Error(`El número de iteraciones para ${node.keyword} debe ser numérico.`);
+  }
+  if (!Number.isInteger(iterations) || iterations < 0) {
+    throw new Error(`El número de iteraciones para ${node.keyword} debe ser un entero positivo.`);
+  }
+
+  for (let i = 0; i < iterations; i += 1) {
+    executeSequence(node.body, variables, outputLines, messages);
+  }
+}
+
+function evaluateCondition(condition, variables) {
+  const trimmed = condition.trim();
+  if (!trimmed) {
+    throw new Error('La condición IF no puede estar vacía.');
+  }
+
+  const comparisonMatch = trimmed.match(/^(.*?)(=|<>|>=|<=|>|<)(.*)$/);
+  if (comparisonMatch) {
+    const leftExpression = comparisonMatch[1].trim();
+    const operator = comparisonMatch[2];
+    const rightExpression = comparisonMatch[3].trim();
+    if (!leftExpression || !rightExpression) {
+      throw new Error('La comparación IF requiere operandos a ambos lados del operador.');
+    }
+
+    const leftValue = evaluateExpression(leftExpression, variables);
+    const rightValue = evaluateExpression(rightExpression, variables);
+
+    const leftNumber = Number(leftValue);
+    const rightNumber = Number(rightValue);
+    const bothNumeric = !Number.isNaN(leftNumber) && !Number.isNaN(rightNumber);
+
+    const [leftComparable, rightComparable] = bothNumeric
+      ? [leftNumber, rightNumber]
+      : [String(leftValue), String(rightValue)];
+
+    switch (operator) {
+      case '=':
+        return leftComparable === rightComparable;
+      case '<>':
+        return leftComparable !== rightComparable;
+      case '>':
+        return leftComparable > rightComparable;
+      case '<':
+        return leftComparable < rightComparable;
+      case '>=':
+        return leftComparable >= rightComparable;
+      case '<=':
+        return leftComparable <= rightComparable;
+      default:
+        throw new Error(`Operador de comparación no soportado: ${operator}`);
+    }
+  }
+
+  const value = evaluateExpression(trimmed, variables);
+  if (typeof value === 'number') {
+    return value !== 0;
+  }
+  return Boolean(value);
 }
 
 function handleData(statement, variables) {
