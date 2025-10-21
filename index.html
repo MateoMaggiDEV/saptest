@@ -44,6 +44,7 @@
             <div class="editor__toolbar">
               <div class="toolbar__group">
                 <button id="runButton" type="button">Ejecutar</button>
+                <button id="debugButton" type="button">Depurar</button>
                 <button id="resetButton" type="button">Restablecer</button>
               </div>
               <span class="toolbar__hint"
@@ -60,6 +61,38 @@
             <div class="output__section">
               <h2>Mensajes</h2>
               <pre id="messages"></pre>
+            </div>
+            <div class="output__section output__section--debug">
+              <h2>Depuración</h2>
+              <p id="debugHint" class="debug-panel__hint">
+                Presiona <strong>Depurar</strong> para analizar el programa paso a
+                paso.
+              </p>
+              <div id="debugPanel" class="debug-panel" hidden>
+                <div class="debug-panel__controls">
+                  <button id="debugPrev" type="button" aria-label="Paso anterior">
+                    &#9664;
+                  </button>
+                  <span id="debugPosition" aria-live="polite">Paso 0 de 0</span>
+                  <button id="debugNext" type="button" aria-label="Paso siguiente">
+                    &#9654;
+                  </button>
+                </div>
+                <div class="debug-panel__content">
+                  <section>
+                    <h3>Sentencia</h3>
+                    <pre id="debugStatement"></pre>
+                  </section>
+                  <section>
+                    <h3>Salida parcial</h3>
+                    <pre id="debugOutput"></pre>
+                  </section>
+                  <section>
+                    <h3>Variables</h3>
+                    <pre id="debugVariables"></pre>
+                  </section>
+                </div>
+              </div>
             </div>
           </section>
         </section>
