@@ -7,36 +7,70 @@
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <main class="layout">
-      <header class="layout__header">
-        <h1>Ejecutor ABAP local</h1>
-        <p>
-          Escribe tu código ABAP en el panel izquierdo y presiona
-          <strong>Ejecutar</strong> para simular su comportamiento de forma local.
-          El intérprete soporta un subconjunto de instrucciones como
-          <code>DATA</code>, <code>WRITE</code>, asignaciones, <code>ADD</code> y
-          <code>SUBTRACT</code>.
-        </p>
+    <div class="sap-shell">
+      <header class="sap-shell__bar">
+        <div class="sap-shell__brand">
+          <span class="sap-shell__system">SAP</span>
+          <span class="sap-shell__title">Mini entorno ABAP local</span>
+        </div>
+        <div class="sap-shell__session">
+          <span class="sap-shell__client">Mandante 001</span>
+          <span class="sap-shell__separator" aria-hidden="true">|</span>
+          <span class="sap-shell__user">Usuario: T-TRAINEE</span>
+        </div>
       </header>
-      <section class="layout__workspace">
-        <section class="editor">
-          <div class="editor__toolbar">
-            <div class="toolbar__group">
-              <button id="runButton" type="button">Ejecutar</button>
-              <button id="resetButton" type="button">Restablecer</button>
+
+      <nav class="sap-shell__breadcrumb" aria-label="Ruta de navegación">
+        <ol>
+          <li>Favoritos</li>
+          <li>Simuladores</li>
+          <li aria-current="page">Ejecutor ABAP local</li>
+        </ol>
+      </nav>
+
+      <main class="layout">
+        <header class="layout__header">
+          <h1>Ejecutor ABAP local</h1>
+          <p>
+            Escribe tu código ABAP en el panel izquierdo y presiona
+            <strong>Ejecutar</strong> para simular su comportamiento de forma local.
+            El intérprete soporta un subconjunto de instrucciones como
+            <code>DATA</code>, <code>WRITE</code>, asignaciones, <code>ADD</code> y
+            <code>SUBTRACT</code>.
+          </p>
+        </header>
+        <section class="layout__workspace">
+          <section class="editor" aria-label="Editor ABAP">
+            <div class="editor__toolbar">
+              <div class="toolbar__group">
+                <button id="runButton" type="button">Ejecutar</button>
+                <button id="resetButton" type="button">Restablecer</button>
+              </div>
+              <span class="toolbar__hint"
+                >Los comentarios con <code>*</code> o <code>"</code> son ignorados.</span
+              >
             </div>
-            <span class="toolbar__hint">Los comentarios con <code>*</code> o <code>"</code> son ignorados.</span>
-          </div>
-          <textarea id="abapEditor" spellcheck="false"></textarea>
+            <textarea id="abapEditor" spellcheck="false"></textarea>
+          </section>
+          <section class="output" aria-label="Resultados de la simulación">
+            <div class="output__section">
+              <h2>Salida</h2>
+              <pre id="output"></pre>
+            </div>
+            <div class="output__section">
+              <h2>Mensajes</h2>
+              <pre id="messages"></pre>
+            </div>
+          </section>
         </section>
-        <section class="output">
-          <h2>Salida</h2>
-          <pre id="output"></pre>
-          <h2>Mensajes</h2>
-          <pre id="messages"></pre>
-        </section>
-      </section>
-    </main>
+      </main>
+
+      <footer class="sap-shell__status" role="status">
+        <span>Conexión: Local</span>
+        <span class="sap-shell__separator" aria-hidden="true">|</span>
+        <span>Idioma: ES</span>
+      </footer>
+    </div>
     <script src="app.js"></script>
   </body>
 </html>
